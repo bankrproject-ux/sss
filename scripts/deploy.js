@@ -20,9 +20,7 @@ function ask(question) {
 function askHidden(question) {
   return new Promise((resolve, reject) => {
     if (!stdin.isTTY || typeof stdin.setRawMode !== "function") {
-      reject(
-        new Error("Hidden input requires an interactive terminal.")
-      );
+      reject(new Error("Run this script in an interactive CMD terminal."));
       return;
     }
 
@@ -42,7 +40,7 @@ function askHidden(question) {
       if (key === "\u0003") {
         cleanup();
         stdout.write("\n");
-        reject(new Error("Input cancelled."));
+        reject(new Error("Cancelled."));
         return;
       }
 
@@ -70,9 +68,9 @@ function askHidden(question) {
 }
 
 async function main() {
-  console.log("\n==============================");
-  console.log("     ORVYN NFT DEPLOYER");
-  console.log("==============================\n");
+  console.log("\n================================");
+  console.log("       ORVYN NFT DEPLOYER");
+  console.log("================================\n");
 
   const privateKey = await askHidden(
     "Enter deployer private key (hidden): "
@@ -82,53 +80,100 @@ async function main() {
     throw new Error("Invalid private key format.");
   }
 
-  const owner = await ask("Enter owner wallet address: ");
+  const ownerWallet = await ask("Enter owner wallet address: ");
 
-  if (!hre.ethers.isAddress(owner)) {
+  if (!hre.ethers.isAddress(ownerWallet)) {
     throw new Error("Invalid owner wallet address.");
   }
 
-  const baseURI = await ask(
-    "Enter metadata base URI (IPFS, when ready): "
-  );
+  const network = await hre.ethers.provider.getNetwork();
 
-  if (!baseURI.startsWith("ipfs://")) {
-    throw new Error("Metadata URI must start with ipfs://");
+  if (network.chainId !== 56n) {
+    throw new Error(
+      `Wrong network: chain ID ${network.chainId}. Expected 56.`
+    );
   }
 
   const provider = hre.ethers.provider;
-  const network = await provider.getNetwork();
+  const deployer = new hre.ethers.Wallet(privateKey, provider);
 
-  if (network.chainId !== 56n) {
-    throw new Error("Wrong network. Expected BNB Smart Chain Mainnet.");
-  }
+  const balance = await provider.getBalance(deployer.address);
 
-  const wallet = new hre.ethers.Wallet(
-    privateKey,
-    provider
+  console.log("\nDeployment configuration");
+  console.log("------------------------");
+  console.log("Network: BNB Smart Chain Mainnet");
+  console.log("Chain ID: 56");
+  console.log("Deployer:", deployer.address);
+  console.log("Owner:", ownerWallet);
+  console.log("Deployer balance:", hre.ethers.formatEther(balance), "BNB");
+
+  const feeData = await provider.getFeeData();
+  const factory = await hre.ethers.getContractFactory(
+    "ORVYN",
+    deployer
   );
 
-  console.log("\nDeployer:", wallet.address);
-  console.log("Owner:", owner);
-  console.log("Network: BNB Smart Chain Mainnet");
+  const deployTx = await factory.getDeployTransaction(ownerWallet);
+  const estimatedGas = await provider.estimateGas({
+    ...deployTx,
+    from: deployer.address
+  });
 
-  const balance = await provider.getBalance(wallet.address);
+  const gasPrice = feeData.gasPrice;
+
+  if (gasPrice === null) {
+    throw new Error("Unable to retrieve current gas price.");
+  }
+
+  const estimatedCost = estimatedGas * gasPrice;
+
   console.log(
-    "Deployer balance:",
-    hre.ethers.formatEther(balance),
+    "Estimated deployment gas:",
+    estimatedGas.toString()
+  );
+
+  console.log(
+    "Estimated deployment cost:",
+    hre.ethers.formatEther(estimatedCost),
     "BNB"
   );
 
-  console.log(
-    "\nDeployment will be enabled after ORVYN.sol is finalized."
-  );
-  console.log("No transaction has been sent.");
+  if (balance < estimatedCost) {
+    throw new Error("Insufficient BNB for estimated deployment gas.");
+  }
 
-  // The contract factory and deployment will be added
-  // after the final ORVYN.sol constructor is confirmed.
+  const confirm = await ask(
+    "\nDeploy ORVYN to MAINNET? Type DEPLOY to continue: "
+  );
+
+  if (confirm !== "DEPLOY") {
+    console.log("Deployment cancelled. No transaction sent.");
+    return;
+  }
+
+  console.log("\nDeploying ORVYN...");
+
+  const contract = await factory.deploy(ownerWallet);
+  await contract.waitForDeployment();
+
+  const contractAddress = await contract.getAddress();
+  const deploymentTx = contract.deploymentTransaction();
+
+  console.log("\n================================");
+  console.log("    ORVYN DEPLOYED SUCCESSFULLY");
+  console.log("================================");
+  console.log("Contract address:", contractAddress);
+  console.log("Owner wallet:", ownerWallet);
+  console.log("Deployer wallet:", deployer.address);
+  console.log("Transaction hash:", deploymentTx.hash);
+  console.log(
+    "Explorer:",
+    `https://bscscan.com/address/${contractAddress}`
+  );
+  console.log("\nSave the contract address for verification.");
 }
 
 main().catch((error) => {
-  console.error("\nError:", error.message);
+  console.error("\nDeployment error:", error.shortMessage || error.message);
   process.exitCode = 1;
 });
