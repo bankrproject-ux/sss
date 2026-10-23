@@ -14,7 +14,7 @@ module.exports = {
   },
   networks: {
     bsc: {
-      url: process.env.BSC_RPC_URL || "https://bsc-dataseed.binance.org/",
+      url: process.env.BSC_RPC_URL || "https://bsc-dataseed.bnbchain.org",
       chainId: 56
     }
   }
