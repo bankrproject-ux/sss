@@ -69,7 +69,7 @@ function askHidden(question) {
 
 async function main() {
   console.log("\n================================");
-  console.log("       ORVYN NFT DEPLOYER");
+  console.log("       VORT NFT DEPLOYER");
   console.log("================================\n");
 
   const privateKey = await askHidden(
@@ -109,7 +109,7 @@ async function main() {
 
   const feeData = await provider.getFeeData();
   const factory = await hre.ethers.getContractFactory(
-    "ORVYN",
+    "VORT",
     deployer
   );
 
@@ -143,7 +143,7 @@ async function main() {
   }
 
   const confirm = await ask(
-    "\nDeploy ORVYN to MAINNET? Type DEPLOY to continue: "
+    "\nDeploy VORT to MAINNET? Type DEPLOY to continue: "
   );
 
   if (confirm !== "DEPLOY") {
@@ -160,7 +160,7 @@ async function main() {
   const deploymentTx = contract.deploymentTransaction();
 
   console.log("\n================================");
-  console.log("    ORVYN DEPLOYED SUCCESSFULLY");
+  console.log("    VORT DEPLOYED SUCCESSFULLY");
   console.log("================================");
   console.log("Contract address:", contractAddress);
   console.log("Owner wallet:", ownerWallet);
