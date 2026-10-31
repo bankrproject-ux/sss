@@ -69,7 +69,7 @@ function askHidden(question) {
 
 async function main() {
   console.log("\n================================");
-  console.log("       VORT NFT DEPLOYER");
+  console.log("      VORT TOKEN DEPLOYER");
   console.log("================================\n");
 
   const privateKey = await askHidden(
@@ -78,12 +78,6 @@ async function main() {
 
   if (!/^0x[0-9a-fA-F]{64}$/.test(privateKey)) {
     throw new Error("Invalid private key format.");
-  }
-
-  const ownerWallet = await ask("Enter owner wallet address: ");
-
-  if (!hre.ethers.isAddress(ownerWallet)) {
-    throw new Error("Invalid owner wallet address.");
   }
 
   const network = await hre.ethers.provider.getNetwork();
@@ -101,19 +95,28 @@ async function main() {
 
   console.log("\nDeployment configuration");
   console.log("------------------------");
+  console.log("Token: VORT");
+  console.log("Symbol: VORT");
+  console.log("Total supply: 1,000,000,000 VORT");
   console.log("Network: BNB Smart Chain Mainnet");
   console.log("Chain ID: 56");
-  console.log("Deployer:", deployer.address);
-  console.log("Owner:", ownerWallet);
-  console.log("Deployer balance:", hre.ethers.formatEther(balance), "BNB");
+  console.log("Deployer / Initial Token Holder:", deployer.address);
+  console.log(
+    "Deployer balance:",
+    hre.ethers.formatEther(balance),
+    "BNB"
+  );
 
   const feeData = await provider.getFeeData();
+
   const factory = await hre.ethers.getContractFactory(
-    "VORT",
+    "VORTToken",
     deployer
   );
 
-  const deployTx = await factory.getDeployTransaction(ownerWallet);
+  // Token constructor does not require arguments.
+  const deployTx = await factory.getDeployTransaction();
+
   const estimatedGas = await provider.estimateGas({
     ...deployTx,
     from: deployer.address
@@ -128,7 +131,7 @@ async function main() {
   const estimatedCost = estimatedGas * gasPrice;
 
   console.log(
-    "Estimated deployment gas:",
+    "\nEstimated deployment gas:",
     estimatedGas.toString()
   );
 
@@ -143,7 +146,7 @@ async function main() {
   }
 
   const confirm = await ask(
-    "\nDeploy VORT to MAINNET? Type DEPLOY to continue: "
+    "\nDeploy VORT TOKEN to MAINNET? Type DEPLOY to continue: "
   );
 
   if (confirm !== "DEPLOY") {
@@ -151,29 +154,56 @@ async function main() {
     return;
   }
 
-  console.log("\nDeploying ORVYN...");
+  console.log("\nDeploying VORT Token...");
 
-  const contract = await factory.deploy(ownerWallet);
+  const contract = await factory.deploy();
+
+  console.log("Transaction sent. Waiting for confirmation...");
+
   await contract.waitForDeployment();
 
   const contractAddress = await contract.getAddress();
   const deploymentTx = contract.deploymentTransaction();
 
+  const totalSupply = await contract.totalSupply();
+  const tokenBalance = await contract.balanceOf(deployer.address);
+
   console.log("\n================================");
-  console.log("    VORT DEPLOYED SUCCESSFULLY");
+  console.log(" VORT TOKEN DEPLOYED SUCCESSFULLY");
   console.log("================================");
+
+  console.log("Token name: VORT");
+  console.log("Token symbol: VORT");
+  console.log(
+    "Total supply:",
+    hre.ethers.formatUnits(totalSupply, 18),
+    "VORT"
+  );
+
   console.log("Contract address:", contractAddress);
-  console.log("Owner wallet:", ownerWallet);
-  console.log("Deployer wallet:", deployer.address);
+  console.log("Initial token holder:", deployer.address);
+  console.log(
+    "Deployer token balance:",
+    hre.ethers.formatUnits(tokenBalance, 18),
+    "VORT"
+  );
+
   console.log("Transaction hash:", deploymentTx.hash);
+
   console.log(
     "Explorer:",
     `https://bscscan.com/address/${contractAddress}`
   );
-  console.log("\nSave the contract address for verification.");
+
+  console.log("\nSave the token contract address.");
+  console.log("This address will be needed for the VORT Claim Contract.");
 }
 
 main().catch((error) => {
-  console.error("\nDeployment error:", error.shortMessage || error.message);
+  console.error(
+    "\nDeployment error:",
+    error.shortMessage || error.message
+  );
+
   process.exitCode = 1;
 });
