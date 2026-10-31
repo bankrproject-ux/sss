@@ -36,19 +36,20 @@ contract VORTClaim is ReentrancyGuard {
         uint256 amount
     );
 
-    constructor() {
-        nftContract = IERC721(
-            0xb8a529f9bb1eedd3def2f5178678c447c646d034b
-        );
+   
+constructor() {
+    nftContract = IERC721(
+        0xb8a529F9bB1EEd3dEf2F5178678C447C646D034B
+    );
 
-        tokenContract = IERC20(
-            0x8629f95ef3c0ea98cb1944964e640a9cc135c889
-        );
+    tokenContract = IERC20(
+        0x8629f95Ef3C0Ea98CB1944964e640A9Cc135C889
+    );
 
-        feeRecipient = payable(
-            0x50d5247defa13922c89a6276d725844b905fa73b
-        );
-    }
+    feeRecipient = payable(
+        0x50D5247deFa13922C89a6276D725844b905FA73b
+    );
+}
 
     function claim(
         uint256[] calldata tokenIds
