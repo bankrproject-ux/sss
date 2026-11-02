@@ -35,14 +35,15 @@ contract INPHIC {
     string public constant symbol = "INPHIC";
     uint8 public constant decimals = 18;
 
-    // Supply
     uint256 public constant TOTAL_SUPPLY = 500_000_000 ether;
+
+    // Shares
     uint256 public constant MAX_SHARES = 3500;
     uint256 public constant FREE_SHARES = 1500;
     uint256 public constant PAID_SHARES = 2000;
     uint256 public constant TOKENS_PER_SHARE = 100_000 ether;
 
-    // Allocations
+    // Allocation
     uint256 public constant LP_ALLOCATION = 80_000_000 ether;
     uint256 public constant TEAM_ALLOCATION = 50_000_000 ether;
     uint256 public constant COMMUNITY_ALLOCATION = 20_000_000 ether;
@@ -52,15 +53,12 @@ contract INPHIC {
     uint256 public constant FIRST_TIER_PRICE = 0.0005 ether;
     uint256 public constant SECOND_TIER_PRICE = 0.001 ether;
 
-    // Financial settings
+    // Fees
     uint256 public constant REFUND_WINDOW = 24 hours;
     uint256 public constant REFUND_BPS = 8000;
     uint256 public constant LIQUIDITY_BPS = 8000;
     uint256 public constant BUY_TAX_BPS = 300;
     uint256 public constant SELL_TAX_BPS = 300;
-
-    // Maximum deposits processed per withdrawal call
-    uint256 public constant WITHDRAW_BATCH_SIZE = 50;
 
     address public immutable owner;
     address payable public immutable treasury;
@@ -74,7 +72,7 @@ contract INPHIC {
     // 1 = Minting
     // 2 = Launch pending
     // 3 = Launched
-    // 4 = Sale stopped
+    // 4 = Sale withdrawn
     uint8 public phase = 1;
 
     bool public paused;
@@ -84,11 +82,6 @@ contract INPHIC {
     uint256 public freeSharesClaimed;
     uint256 public totalRaised;
 
-    uint256 public refundLiability;
-    uint256 public treasuryAccrued;
-
-    // Historical paid shares never decrease after refunds.
-    // Prevents reusing the cheaper first 10-share tier.
     mapping(uint256 => uint256) public paidEverById;
     mapping(uint256 => bool) public freeClaimedById;
 
@@ -98,18 +91,13 @@ contract INPHIC {
         uint256 timestamp;
         uint256 shares;
         uint256 agentId;
-        uint256 refundAmount;
         bool refunded;
         bool settled;
-        bool classified;
     }
 
     Deposit[] private deposits;
 
     mapping(address => uint256[]) private buyerDepositIds;
-
-    uint256 public classificationCursor;
-    uint256 public expiryCursor;
 
     bool private entered;
 
@@ -128,11 +116,7 @@ contract INPHIC {
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed tokenOwner, address indexed spender, uint256 value);
 
-    event FreeClaimed(
-        address indexed user,
-        uint256 indexed agentId,
-        uint256 tokenAmount
-    );
+    event FreeClaimed(address indexed user, uint256 indexed agentId);
 
     event Minted(
         address indexed user,
@@ -142,7 +126,7 @@ contract INPHIC {
         uint256 depositId
     );
 
-    event DepositRefunded(
+    event Refunded(
         address indexed user,
         uint256 indexed depositId,
         uint256 amount
@@ -157,8 +141,7 @@ contract INPHIC {
         uint256 treasuryAmount
     );
 
-    event SaleStopped();
-    event ResidueWithdrawn(uint256 amount);
+    event SaleWithdrawn(uint256 amount);
     event PhaseChanged(uint8 phase);
 
     constructor(
@@ -204,9 +187,9 @@ contract INPHIC {
         emit PhaseChanged(1);
     }
 
-    // ------------------------------------------------------------
-    // VIEW FUNCTIONS
-    // ------------------------------------------------------------
+    // --------------------------------------------------
+    // VIEWS
+    // --------------------------------------------------
 
     function totalSoldShares() public view returns (uint256) {
         return paidSharesSold + freeSharesClaimed;
@@ -242,22 +225,21 @@ contract INPHIC {
     ) public pure returns (uint256) {
         require(requested > 0, "BAD_QUANTITY");
 
-        uint256 firstTierRemaining =
+        uint256 firstRemaining =
             alreadyPaid >= FIRST_TIER_SHARES
                 ? 0
                 : FIRST_TIER_SHARES - alreadyPaid;
 
-        uint256 firstTierCount =
-            requested < firstTierRemaining
+        uint256 firstCount =
+            requested < firstRemaining
                 ? requested
-                : firstTierRemaining;
+                : firstRemaining;
 
-        uint256 secondTierCount =
-            requested - firstTierCount;
+        uint256 secondCount = requested - firstCount;
 
         return
-            (firstTierCount * FIRST_TIER_PRICE) +
-            (secondTierCount * SECOND_TIER_PRICE);
+            (firstCount * FIRST_TIER_PRICE) +
+            (secondCount * SECOND_TIER_PRICE);
     }
 
     function userInfo(
@@ -265,16 +247,16 @@ contract INPHIC {
     ) external view returns (
         uint256 agentId,
         uint256 paidSharesEver,
-        uint256 remainingFirstTierShares,
+        uint256 remainingFirstTier,
         bool freeClaimed,
-        uint256 userDepositCount
+        uint256 userDeposits
     ) {
         agentId = identityResolver.identityOf(user);
 
         paidSharesEver =
             agentId == 0 ? 0 : paidEverById[agentId];
 
-        remainingFirstTierShares =
+        remainingFirstTier =
             paidSharesEver >= FIRST_TIER_SHARES
                 ? 0
                 : FIRST_TIER_SHARES - paidSharesEver;
@@ -282,50 +264,43 @@ contract INPHIC {
         freeClaimed =
             agentId != 0 && freeClaimedById[agentId];
 
-        userDepositCount = buyerDepositIds[user].length;
+        userDeposits = buyerDepositIds[user].length;
     }
 
-    // ------------------------------------------------------------
+    // --------------------------------------------------
     // FREE CLAIM
-    // ------------------------------------------------------------
+    // --------------------------------------------------
 
     function claimFree() external nonReentrant {
         require(!paused, "PAUSED");
         require(phase == 1, "WRONG_PHASE");
         require(freeSharesClaimed < FREE_SHARES, "FREE_SOLD_OUT");
-
-        uint256 agentId =
-            identityResolver.identityOf(msg.sender);
-
-        require(agentId != 0, "NO_AGENT_ID");
-        require(!freeClaimedById[agentId], "ALREADY_CLAIMED");
         require(totalSoldShares() < MAX_SHARES, "SOLD_OUT");
 
-        freeClaimedById[agentId] = true;
+        uint256 id = identityResolver.identityOf(msg.sender);
+
+        require(id != 0, "NO_AGENT_ID");
+        require(!freeClaimedById[id], "ALREADY_CLAIMED");
+
+        freeClaimedById[id] = true;
         freeSharesClaimed++;
 
-        _move(
-            address(this),
-            msg.sender,
-            TOKENS_PER_SHARE
-        );
+        _move(address(this), msg.sender, TOKENS_PER_SHARE);
 
-        emit FreeClaimed(
-            msg.sender,
-            agentId,
-            TOKENS_PER_SHARE
-        );
+        emit FreeClaimed(msg.sender, id);
 
         _checkSoldOut();
     }
 
-    // ------------------------------------------------------------
+    // --------------------------------------------------
     // PAID MINT
-    // ------------------------------------------------------------
+    // --------------------------------------------------
 
-    function mint(
-        uint256 requested
-    ) external payable nonReentrant {
+    function mint(uint256 requested)
+        external
+        payable
+        nonReentrant
+    {
         require(!paused, "PAUSED");
         require(phase == 1, "WRONG_PHASE");
         require(requested > 0, "BAD_QUANTITY");
@@ -340,19 +315,17 @@ contract INPHIC {
             "SOLD_OUT"
         );
 
-        uint256 agentId =
-            identityResolver.identityOf(msg.sender);
-
-        require(agentId != 0, "NO_AGENT_ID");
+        uint256 id = identityResolver.identityOf(msg.sender);
+        require(id != 0, "NO_AGENT_ID");
 
         uint256 cost = quoteMint(
             requested,
-            paidEverById[agentId]
+            paidEverById[id]
         );
 
         require(msg.value == cost, "INCORRECT_BNB");
 
-        paidEverById[agentId] += requested;
+        paidEverById[id] += requested;
         paidSharesSold += requested;
         totalRaised += cost;
 
@@ -364,11 +337,9 @@ contract INPHIC {
                 amount: cost,
                 timestamp: block.timestamp,
                 shares: requested,
-                agentId: agentId,
-                refundAmount: 0,
+                agentId: id,
                 refunded: false,
-                settled: false,
-                classified: false
+                settled: false
             })
         );
 
@@ -380,33 +351,21 @@ contract INPHIC {
             requested * TOKENS_PER_SHARE
         );
 
-        emit Minted(
-            msg.sender,
-            agentId,
-            requested,
-            cost,
-            depositId
-        );
+        emit Minted(msg.sender, id, requested, cost, depositId);
 
         _checkSoldOut();
     }
 
-    // ------------------------------------------------------------
-    // REFUND PER DEPOSIT
-    // ------------------------------------------------------------
+    // --------------------------------------------------
+    // REFUND
+    // --------------------------------------------------
 
-    function refundDeposit(
-        uint256 depositId
-    ) external nonReentrant {
-        require(
-            phase == 1 || phase == 4,
-            "REFUND_CLOSED"
-        );
-
-        require(
-            depositId < deposits.length,
-            "BAD_DEPOSIT_ID"
-        );
+    function refundDeposit(uint256 depositId)
+        external
+        nonReentrant
+    {
+        require(phase == 1, "REFUND_CLOSED");
+        require(depositId < deposits.length, "BAD_DEPOSIT_ID");
 
         Deposit storage d = deposits[depositId];
 
@@ -418,13 +377,10 @@ contract INPHIC {
             "REFUND_EXPIRED"
         );
 
-        bool wasClassified = d.classified;
-
         uint256 refundAmount =
             (d.amount * REFUND_BPS) / 10_000;
 
-        uint256 treasuryPart =
-            d.amount - refundAmount;
+        uint256 treasuryPart = d.amount - refundAmount;
 
         uint256 tokenAmount =
             d.shares * TOKENS_PER_SHARE;
@@ -436,40 +392,17 @@ contract INPHIC {
 
         d.refunded = true;
         d.settled = true;
-        d.classified = true;
-        d.refundAmount = refundAmount;
 
         paidSharesSold -= d.shares;
+        totalRaised -= d.amount;
 
-        _move(
-            msg.sender,
-            address(this),
-            tokenAmount
-        );
+        _move(msg.sender, address(this), tokenAmount);
 
-        if (phase == 1) {
-            totalRaised -= d.amount;
+        if (treasuryPart > 0) {
+            (bool treasuryOk, ) =
+                treasury.call{value: treasuryPart}("");
 
-            if (treasuryPart > 0) {
-                (bool treasuryOk, ) =
-                    treasury.call{value: treasuryPart}("");
-
-                require(
-                    treasuryOk,
-                    "TREASURY_TRANSFER_FAILED"
-                );
-            }
-        } else {
-            if (wasClassified) {
-                require(
-                    refundLiability >= refundAmount,
-                    "REFUND_ACCOUNTING_ERROR"
-                );
-
-                refundLiability -= refundAmount;
-            } else {
-                treasuryAccrued += treasuryPart;
-            }
+            require(treasuryOk, "TREASURY_TRANSFER_FAILED");
         }
 
         (bool ok, ) =
@@ -477,136 +410,39 @@ contract INPHIC {
 
         require(ok, "REFUND_TRANSFER_FAILED");
 
-        emit DepositRefunded(
-            msg.sender,
-            depositId,
-            refundAmount
-        );
+        emit Refunded(msg.sender, depositId, refundAmount);
     }
 
-    // ------------------------------------------------------------
-    // WITHDRAW RESIDUE / STOP SALE
-    // ------------------------------------------------------------
+    // --------------------------------------------------
+    // WITHDRAW RESIDUE
+    // --------------------------------------------------
 
     function withdrawResidue()
         external
         onlyOwner
         nonReentrant
     {
-        require(
-            phase == 1 || phase == 4,
-            "WRONG_PHASE"
-        );
+        require(phase == 1, "WRONG_PHASE");
 
-        // First call automatically stops minting.
-        if (phase == 1) {
-            phase = 4;
+        // Stop mint and close all refund claims.
+        phase = 4;
+        emit PhaseChanged(4);
 
-            emit PhaseChanged(4);
-            emit SaleStopped();
-        }
+        // Sweep the entire native BNB balance.
+        uint256 amount = address(this).balance;
 
-        uint256 len = deposits.length;
-        uint256 processed;
+        require(amount > 0, "NO_BNB_BALANCE");
 
-        // Classify deposits in batches of 50.
-        while (
-            classificationCursor < len &&
-            processed < WITHDRAW_BATCH_SIZE
-        ) {
-            Deposit storage d =
-                deposits[classificationCursor];
+        (bool ok, ) = treasury.call{value: amount}("");
 
-            if (
-                !d.refunded &&
-                !d.settled &&
-                !d.classified
-            ) {
-                d.classified = true;
+        require(ok, "TREASURY_TRANSFER_FAILED");
 
-                // Deposit older than 24 hours:
-                // entire deposit belongs to treasury.
-                if (
-                    block.timestamp >=
-                    d.timestamp + REFUND_WINDOW
-                ) {
-                    d.settled = true;
-                    treasuryAccrued += d.amount;
-                } else {
-                    // Deposit younger than 24 hours:
-                    // 80% refundable, 20% treasury.
-                    uint256 refundAmount =
-                        (d.amount * REFUND_BPS) / 10_000;
-
-                    d.refundAmount = refundAmount;
-
-                    refundLiability += refundAmount;
-
-                    treasuryAccrued +=
-                        d.amount - refundAmount;
-                }
-            }
-
-            classificationCursor++;
-            processed++;
-        }
-
-        // Only sweep expired refunds after all deposits
-        // have been classified.
-        if (classificationCursor == len) {
-            processed = 0;
-
-            while (
-                expiryCursor < len &&
-                processed < WITHDRAW_BATCH_SIZE
-            ) {
-                Deposit storage d =
-                    deposits[expiryCursor];
-
-                if (
-                    !d.refunded &&
-                    !d.settled &&
-                    d.refundAmount > 0
-                ) {
-                    if (
-                        block.timestamp <
-                        d.timestamp + REFUND_WINDOW
-                    ) {
-                        break;
-                    }
-
-                    d.settled = true;
-
-                    refundLiability -= d.refundAmount;
-
-                    treasuryAccrued += d.refundAmount;
-
-                    d.refundAmount = 0;
-                }
-
-                expiryCursor++;
-                processed++;
-            }
-        }
-
-        // Transfer only funds already belonging to treasury.
-        uint256 amount = treasuryAccrued;
-
-        if (amount > 0) {
-            treasuryAccrued = 0;
-
-            (bool ok, ) =
-                treasury.call{value: amount}("");
-
-            require(ok, "TREASURY_TRANSFER_FAILED");
-
-            emit ResidueWithdrawn(amount);
-        }
+        emit SaleWithdrawn(amount);
     }
 
-    // ------------------------------------------------------------
+    // --------------------------------------------------
     // AUTO LAUNCH
-    // ------------------------------------------------------------
+    // --------------------------------------------------
 
     function _checkSoldOut() internal {
         if (totalSoldShares() == MAX_SHARES) {
@@ -615,31 +451,20 @@ contract INPHIC {
             emit PhaseChanged(2);
             emit LaunchPending();
 
-            // Launch failure must not revert the final mint.
+            // Failed auto-launch does not revert mint.
             try this.autoLaunch() {} catch {}
         }
     }
 
     function autoLaunch() external {
-        require(
-            msg.sender == address(this),
-            "SELF_ONLY"
-        );
-
+        require(msg.sender == address(this), "SELF_ONLY");
         require(phase == 2, "WRONG_PHASE");
 
         _launch();
     }
 
-    function launch()
-        external
-        onlyOwner
-        nonReentrant
-    {
-        require(
-            phase == 2,
-            "LAUNCH_NOT_PENDING"
-        );
+    function launch() external onlyOwner nonReentrant {
+        require(phase == 2, "LAUNCH_NOT_PENDING");
 
         _launch();
     }
@@ -668,10 +493,7 @@ contract INPHIC {
                 );
         }
 
-        require(
-            lpPair != address(0),
-            "PAIR_CREATION_FAILED"
-        );
+        require(lpPair != address(0), "PAIR_CREATION_FAILED");
 
         uint256 bnbForLiquidity =
             (bnbBalance * LIQUIDITY_BPS) / 10_000;
@@ -684,36 +506,24 @@ contract INPHIC {
 
         emit PhaseChanged(3);
 
-        IWBNB(WBNB).deposit{
-            value: bnbForLiquidity
-        }();
+        IWBNB(WBNB).deposit{value: bnbForLiquidity}();
 
         require(
-            IWBNB(WBNB).transfer(
-                lpPair,
-                bnbForLiquidity
-            ),
+            IWBNB(WBNB).transfer(lpPair, bnbForLiquidity),
             "WBNB_TRANSFER_FAILED"
         );
 
-        // Fixed allocation: 80 million INPHIC.
-        _move(
-            address(this),
-            lpPair,
-            LP_ALLOCATION
-        );
+        // Fixed LP token allocation.
+        _move(address(this), lpPair, LP_ALLOCATION);
 
-        // LP tokens go to dead address.
+        // LP receipt sent to dead address.
         IPancakePair(lpPair).mint(DEAD);
 
         if (bnbForTreasury > 0) {
             (bool ok, ) =
                 treasury.call{value: bnbForTreasury}("");
 
-            require(
-                ok,
-                "TREASURY_TRANSFER_FAILED"
-            );
+            require(ok, "TREASURY_TRANSFER_FAILED");
         }
 
         emit PoolOpened(
@@ -724,37 +534,33 @@ contract INPHIC {
         );
     }
 
-    // ------------------------------------------------------------
+    // --------------------------------------------------
     // ADMIN
-    // ------------------------------------------------------------
+    // --------------------------------------------------
 
     function setPaused(bool value) external onlyOwner {
         paused = value;
     }
 
-    // ------------------------------------------------------------
-    // ERC20 TRANSFERS
-    // ------------------------------------------------------------
+    // --------------------------------------------------
+    // ERC20
+    // --------------------------------------------------
 
-    function transfer(
-        address to,
-        uint256 amount
-    ) external returns (bool) {
+    function transfer(address to, uint256 amount)
+        external
+        returns (bool)
+    {
         _transfer(msg.sender, to, amount);
         return true;
     }
 
-    function approve(
-        address spender,
-        uint256 amount
-    ) external returns (bool) {
+    function approve(address spender, uint256 amount)
+        external
+        returns (bool)
+    {
         allowance[msg.sender][spender] = amount;
 
-        emit Approval(
-            msg.sender,
-            spender,
-            amount
-        );
+        emit Approval(msg.sender, spender, amount);
 
         return true;
     }
@@ -764,14 +570,12 @@ contract INPHIC {
         address to,
         uint256 amount
     ) external returns (bool) {
-        uint256 allowed =
-            allowance[from][msg.sender];
+        uint256 allowed = allowance[from][msg.sender];
 
         require(allowed >= amount, "ALLOWANCE");
 
         if (allowed != type(uint256).max) {
-            allowance[from][msg.sender] =
-                allowed - amount;
+            allowance[from][msg.sender] = allowed - amount;
         }
 
         _transfer(from, to, amount);
@@ -808,21 +612,12 @@ contract INPHIC {
 
         if (tax > 0) {
             balanceOf[treasury] += tax;
-
-            emit Transfer(
-                from,
-                treasury,
-                tax
-            );
+            emit Transfer(from, treasury, tax);
         }
 
         balanceOf[to] += amount - tax;
 
-        emit Transfer(
-            from,
-            to,
-            amount - tax
-        );
+        emit Transfer(from, to, amount - tax);
     }
 
     function _move(
@@ -839,8 +634,6 @@ contract INPHIC {
         emit Transfer(from, to, amount);
     }
 
-    // Direct BNB deposits are not accepted.
-    // Paid BNB must enter through mint().
     receive() external payable {
         revert("USE_PAID_MINT");
     }
