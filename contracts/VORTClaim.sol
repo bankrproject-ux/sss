@@ -1,140 +1,847 @@
-
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
+pragma solidity ^0.8.26;
 
-import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+interface IIdentityResolver {
+    function identityOf(address user) external view returns (uint256);
+}
 
-contract VORTClaim is ReentrancyGuard {
-    using SafeERC20 for IERC20;
+interface IPancakeFactory {
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
 
-    uint256 public constant REWARD_PER_NFT = 50_000 ether;
-    uint256 public constant CLAIM_FEE = 0.0002 ether;
-    uint256 public constant MAX_ALLOCATION = 444_400_000 ether;
-    uint256 public constant MAX_NFT_SUPPLY = 8888;
+interface IPancakePair {
+    function mint(address to) external returns (uint256 liquidity);
+}
 
-    IERC721 public immutable nftContract;
-    IERC20 public immutable tokenContract;
-    address payable public immutable feeRecipient;
+interface IWBNB {
+    function deposit() external payable;
+    function transfer(address to, uint256 value) external returns (bool);
+}
 
-    mapping(uint256 => bool) public claimed;
+contract INPHIC {
+    // BNB Chain Mainnet
+    address public constant WBNB =
+        0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
 
-    uint256 public totalClaimedNFTs;
-    uint256 public totalTokensClaimed;
+    address public constant PANCAKE_FACTORY =
+        0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73;
 
-    event Claimed(
-        address indexed account,
-        uint256 indexed tokenId,
-        uint256 reward
+    address public constant DEAD =
+        0x000000000000000000000000000000000000dEaD;
+
+    // ERC20
+    string public constant name = "INPHIC";
+    string public constant symbol = "INPHIC";
+    uint8 public constant decimals = 18;
+
+    // Supply
+    uint256 public constant TOTAL_SUPPLY = 500_000_000 ether;
+    uint256 public constant MAX_SHARES = 3500;
+    uint256 public constant FREE_SHARES = 1500;
+    uint256 public constant PAID_SHARES = 2000;
+    uint256 public constant TOKENS_PER_SHARE = 100_000 ether;
+
+    // Allocations
+    uint256 public constant LP_ALLOCATION = 80_000_000 ether;
+    uint256 public constant TEAM_ALLOCATION = 50_000_000 ether;
+    uint256 public constant COMMUNITY_ALLOCATION = 20_000_000 ether;
+
+    // Mint pricing
+    uint256 public constant FIRST_TIER_SHARES = 10;
+    uint256 public constant FIRST_TIER_PRICE = 0.0005 ether;
+    uint256 public constant SECOND_TIER_PRICE = 0.001 ether;
+
+    // Financial settings
+    uint256 public constant REFUND_WINDOW = 24 hours;
+    uint256 public constant REFUND_BPS = 8000;
+    uint256 public constant LIQUIDITY_BPS = 8000;
+    uint256 public constant BUY_TAX_BPS = 300;
+    uint256 public constant SELL_TAX_BPS = 300;
+
+    // Maximum deposits processed per withdrawal call
+    uint256 public constant WITHDRAW_BATCH_SIZE = 50;
+
+    address public immutable owner;
+    address payable public immutable treasury;
+    IIdentityResolver public immutable identityResolver;
+
+    uint256 public totalSupply = TOTAL_SUPPLY;
+
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    // 1 = Minting
+    // 2 = Launch pending
+    // 3 = Launched
+    // 4 = Sale stopped
+    uint8 public phase = 1;
+
+    bool public paused;
+    address public pair;
+
+    uint256 public paidSharesSold;
+    uint256 public freeSharesClaimed;
+    uint256 public totalRaised;
+
+    uint256 public refundLiability;
+    uint256 public treasuryAccrued;
+
+    // Historical paid shares never decrease after refunds.
+    // Prevents reusing the cheaper first 10-share tier.
+    mapping(uint256 => uint256) public paidEverById;
+    mapping(uint256 => bool) public freeClaimedById;
+
+    struct Deposit {
+        address buyer;
+        uint256 amount;
+        uint256 timestamp;
+        uint256 shares;
+        uint256 agentId;
+        uint256 refundAmount;
+        bool refunded;
+        bool settled;
+        bool classified;
+    }
+
+    Deposit[] private deposits;
+
+    mapping(address => uint256[]) private buyerDepositIds;
+
+    uint256 public classificationCursor;
+    uint256 public expiryCursor;
+
+    bool private entered;
+
+    modifier nonReentrant() {
+        require(!entered, "REENTRANCY");
+        entered = true;
+        _;
+        entered = false;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "NOT_OWNER");
+        _;
+    }
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed tokenOwner, address indexed spender, uint256 value);
+
+    event FreeClaimed(
+        address indexed user,
+        uint256 indexed agentId,
+        uint256 tokenAmount
     );
 
-    event ClaimFeePaid(
-        address indexed account,
-        uint256 quantity,
+    event Minted(
+        address indexed user,
+        uint256 indexed agentId,
+        uint256 shares,
+        uint256 cost,
+        uint256 depositId
+    );
+
+    event DepositRefunded(
+        address indexed user,
+        uint256 indexed depositId,
         uint256 amount
     );
 
-   
-constructor() {
-    nftContract = IERC721(
-        0xb8a529F9bB1EEd3dEf2F5178678C447C646D034B
+    event LaunchPending();
+
+    event PoolOpened(
+        address indexed pair,
+        uint256 bnbLiquidity,
+        uint256 tokenLiquidity,
+        uint256 treasuryAmount
     );
 
-    tokenContract = IERC20(
-        0x8629f95Ef3C0Ea98CB1944964e640A9Cc135C889
-    );
+    event SaleStopped();
+    event ResidueWithdrawn(uint256 amount);
+    event PhaseChanged(uint8 phase);
 
-    feeRecipient = payable(
-        0x50D5247deFa13922C89a6276D725844b905FA73b
-    );
-}
+    constructor(
+        address _identityResolver,
+        address payable _treasury
+    ) {
+        require(_identityResolver != address(0), "ZERO_RESOLVER");
+        require(_treasury != address(0), "ZERO_TREASURY");
 
-    function claim(
-        uint256[] calldata tokenIds
-    ) external payable nonReentrant {
-        uint256 quantity = tokenIds.length;
+        owner = msg.sender;
+        treasury = _treasury;
+        identityResolver = IIdentityResolver(_identityResolver);
 
-        require(quantity > 0, "Empty token IDs");
-        require(quantity <= MAX_NFT_SUPPLY, "Quantity too large");
-
-        uint256 requiredFee = quantity * CLAIM_FEE;
-        uint256 totalReward = quantity * REWARD_PER_NFT;
-
-        require(msg.value == requiredFee, "Incorrect BNB fee");
+        uint256 publicAllocation =
+            MAX_SHARES * TOKENS_PER_SHARE;
 
         require(
-            totalTokensClaimed + totalReward <= MAX_ALLOCATION,
-            "Claim allocation exhausted"
+            publicAllocation +
+            LP_ALLOCATION +
+            TEAM_ALLOCATION +
+            COMMUNITY_ALLOCATION == TOTAL_SUPPLY,
+            "SUPPLY_MISMATCH"
         );
 
-        // Verify ownership and prevent duplicate claims.
-        for (uint256 i = 0; i < quantity; i++) {
-            uint256 tokenId = tokenIds[i];
+        balanceOf[address(this)] =
+            publicAllocation + LP_ALLOCATION;
 
-            require(
-                tokenId > 0 && tokenId <= MAX_NFT_SUPPLY,
-                "Invalid token ID"
-            );
+        balanceOf[treasury] =
+            TEAM_ALLOCATION + COMMUNITY_ALLOCATION;
 
-            require(
-                nftContract.ownerOf(tokenId) == msg.sender,
-                "Not NFT owner"
-            );
+        emit Transfer(
+            address(0),
+            address(this),
+            publicAllocation + LP_ALLOCATION
+        );
 
-            require(
-                !claimed[tokenId],
-                "NFT already claimed"
-            );
+        emit Transfer(
+            address(0),
+            treasury,
+            TEAM_ALLOCATION + COMMUNITY_ALLOCATION
+        );
 
-            claimed[tokenId] = true;
+        emit PhaseChanged(1);
+    }
+
+    // ------------------------------------------------------------
+    // VIEW FUNCTIONS
+    // ------------------------------------------------------------
+
+    function totalSoldShares() public view returns (uint256) {
+        return paidSharesSold + freeSharesClaimed;
+    }
+
+    function depositCount() external view returns (uint256) {
+        return deposits.length;
+    }
+
+    function getDeposit(
+        uint256 depositId
+    ) external view returns (Deposit memory) {
+        require(depositId < deposits.length, "BAD_DEPOSIT_ID");
+        return deposits[depositId];
+    }
+
+    function buyerDepositCount(
+        address buyer
+    ) external view returns (uint256) {
+        return buyerDepositIds[buyer].length;
+    }
+
+    function getBuyerDepositId(
+        address buyer,
+        uint256 index
+    ) external view returns (uint256) {
+        return buyerDepositIds[buyer][index];
+    }
+
+    function quoteMint(
+        uint256 requested,
+        uint256 alreadyPaid
+    ) public pure returns (uint256) {
+        require(requested > 0, "BAD_QUANTITY");
+
+        uint256 firstTierRemaining =
+            alreadyPaid >= FIRST_TIER_SHARES
+                ? 0
+                : FIRST_TIER_SHARES - alreadyPaid;
+
+        uint256 firstTierCount =
+            requested < firstTierRemaining
+                ? requested
+                : firstTierRemaining;
+
+        uint256 secondTierCount =
+            requested - firstTierCount;
+
+        return
+            (firstTierCount * FIRST_TIER_PRICE) +
+            (secondTierCount * SECOND_TIER_PRICE);
+    }
+
+    function userInfo(
+        address user
+    ) external view returns (
+        uint256 agentId,
+        uint256 paidSharesEver,
+        uint256 remainingFirstTierShares,
+        bool freeClaimed,
+        uint256 userDepositCount
+    ) {
+        agentId = identityResolver.identityOf(user);
+
+        paidSharesEver =
+            agentId == 0 ? 0 : paidEverById[agentId];
+
+        remainingFirstTierShares =
+            paidSharesEver >= FIRST_TIER_SHARES
+                ? 0
+                : FIRST_TIER_SHARES - paidSharesEver;
+
+        freeClaimed =
+            agentId != 0 && freeClaimedById[agentId];
+
+        userDepositCount = buyerDepositIds[user].length;
+    }
+
+    // ------------------------------------------------------------
+    // FREE CLAIM
+    // ------------------------------------------------------------
+
+    function claimFree() external nonReentrant {
+        require(!paused, "PAUSED");
+        require(phase == 1, "WRONG_PHASE");
+        require(freeSharesClaimed < FREE_SHARES, "FREE_SOLD_OUT");
+
+        uint256 agentId =
+            identityResolver.identityOf(msg.sender);
+
+        require(agentId != 0, "NO_AGENT_ID");
+        require(!freeClaimedById[agentId], "ALREADY_CLAIMED");
+        require(totalSoldShares() < MAX_SHARES, "SOLD_OUT");
+
+        freeClaimedById[agentId] = true;
+        freeSharesClaimed++;
+
+        _move(
+            address(this),
+            msg.sender,
+            TOKENS_PER_SHARE
+        );
+
+        emit FreeClaimed(
+            msg.sender,
+            agentId,
+            TOKENS_PER_SHARE
+        );
+
+        _checkSoldOut();
+    }
+
+    // ------------------------------------------------------------
+    // PAID MINT
+    // ------------------------------------------------------------
+
+    function mint(
+        uint256 requested
+    ) external payable nonReentrant {
+        require(!paused, "PAUSED");
+        require(phase == 1, "WRONG_PHASE");
+        require(requested > 0, "BAD_QUANTITY");
+
+        require(
+            paidSharesSold + requested <= PAID_SHARES,
+            "PAID_SOLD_OUT"
+        );
+
+        require(
+            totalSoldShares() + requested <= MAX_SHARES,
+            "SOLD_OUT"
+        );
+
+        uint256 agentId =
+            identityResolver.identityOf(msg.sender);
+
+        require(agentId != 0, "NO_AGENT_ID");
+
+        uint256 cost = quoteMint(
+            requested,
+            paidEverById[agentId]
+        );
+
+        require(msg.value == cost, "INCORRECT_BNB");
+
+        paidEverById[agentId] += requested;
+        paidSharesSold += requested;
+        totalRaised += cost;
+
+        uint256 depositId = deposits.length;
+
+        deposits.push(
+            Deposit({
+                buyer: msg.sender,
+                amount: cost,
+                timestamp: block.timestamp,
+                shares: requested,
+                agentId: agentId,
+                refundAmount: 0,
+                refunded: false,
+                settled: false,
+                classified: false
+            })
+        );
+
+        buyerDepositIds[msg.sender].push(depositId);
+
+        _move(
+            address(this),
+            msg.sender,
+            requested * TOKENS_PER_SHARE
+        );
+
+        emit Minted(
+            msg.sender,
+            agentId,
+            requested,
+            cost,
+            depositId
+        );
+
+        _checkSoldOut();
+    }
+
+    // ------------------------------------------------------------
+    // REFUND PER DEPOSIT
+    // ------------------------------------------------------------
+
+    function refundDeposit(
+        uint256 depositId
+    ) external nonReentrant {
+        require(
+            phase == 1 || phase == 4,
+            "REFUND_CLOSED"
+        );
+
+        require(
+            depositId < deposits.length,
+            "BAD_DEPOSIT_ID"
+        );
+
+        Deposit storage d = deposits[depositId];
+
+        require(d.buyer == msg.sender, "NOT_BUYER");
+        require(!d.refunded && !d.settled, "ALREADY_SETTLED");
+
+        require(
+            block.timestamp < d.timestamp + REFUND_WINDOW,
+            "REFUND_EXPIRED"
+        );
+
+        bool wasClassified = d.classified;
+
+        uint256 refundAmount =
+            (d.amount * REFUND_BPS) / 10_000;
+
+        uint256 treasuryPart =
+            d.amount - refundAmount;
+
+        uint256 tokenAmount =
+            d.shares * TOKENS_PER_SHARE;
+
+        require(
+            balanceOf[msg.sender] >= tokenAmount,
+            "TOKENS_MOVED"
+        );
+
+        d.refunded = true;
+        d.settled = true;
+        d.classified = true;
+        d.refundAmount = refundAmount;
+
+        paidSharesSold -= d.shares;
+
+        _move(
+            msg.sender,
+            address(this),
+            tokenAmount
+        );
+
+        if (phase == 1) {
+            totalRaised -= d.amount;
+
+            if (treasuryPart > 0) {
+                (bool treasuryOk, ) =
+                    treasury.call{value: treasuryPart}("");
+
+                require(
+                    treasuryOk,
+                    "TREASURY_TRANSFER_FAILED"
+                );
+            }
+        } else {
+            if (wasClassified) {
+                require(
+                    refundLiability >= refundAmount,
+                    "REFUND_ACCOUNTING_ERROR"
+                );
+
+                refundLiability -= refundAmount;
+            } else {
+                treasuryAccrued += treasuryPart;
+            }
         }
 
-        totalClaimedNFTs += quantity;
-        totalTokensClaimed += totalReward;
+        (bool ok, ) =
+            msg.sender.call{value: refundAmount}("");
 
-        // Transfer VORT tokens to the calling wallet.
-        tokenContract.safeTransfer(msg.sender, totalReward);
+        require(ok, "REFUND_TRANSFER_FAILED");
 
-        // Forward the claim fee.
-        (bool success, ) = feeRecipient.call{value: requiredFee}("");
-        require(success, "Fee transfer failed");
-
-        for (uint256 i = 0; i < quantity; i++) {
-            emit Claimed(
-                msg.sender,
-                tokenIds[i],
-                REWARD_PER_NFT
-            );
-        }
-
-        emit ClaimFeePaid(msg.sender, quantity, requiredFee);
+        emit DepositRefunded(
+            msg.sender,
+            depositId,
+            refundAmount
+        );
     }
 
-    function isClaimed(
-        uint256 tokenId
-    ) external view returns (bool) {
-        return claimed[tokenId];
-    }
+    // ------------------------------------------------------------
+    // WITHDRAW RESIDUE / STOP SALE
+    // ------------------------------------------------------------
 
-    function getClaimFee(
-        uint256 quantity
-    ) external pure returns (uint256) {
-        return quantity * CLAIM_FEE;
-    }
-
-    function getClaimReward(
-        uint256 quantity
-    ) external pure returns (uint256) {
-        return quantity * REWARD_PER_NFT;
-    }
-
-    function remainingAllocation()
+    function withdrawResidue()
         external
-        view
-        returns (uint256)
+        onlyOwner
+        nonReentrant
     {
-        return MAX_ALLOCATION - totalTokensClaimed;
+        require(
+            phase == 1 || phase == 4,
+            "WRONG_PHASE"
+        );
+
+        // First call automatically stops minting.
+        if (phase == 1) {
+            phase = 4;
+
+            emit PhaseChanged(4);
+            emit SaleStopped();
+        }
+
+        uint256 len = deposits.length;
+        uint256 processed;
+
+        // Classify deposits in batches of 50.
+        while (
+            classificationCursor < len &&
+            processed < WITHDRAW_BATCH_SIZE
+        ) {
+            Deposit storage d =
+                deposits[classificationCursor];
+
+            if (
+                !d.refunded &&
+                !d.settled &&
+                !d.classified
+            ) {
+                d.classified = true;
+
+                // Deposit older than 24 hours:
+                // entire deposit belongs to treasury.
+                if (
+                    block.timestamp >=
+                    d.timestamp + REFUND_WINDOW
+                ) {
+                    d.settled = true;
+                    treasuryAccrued += d.amount;
+                } else {
+                    // Deposit younger than 24 hours:
+                    // 80% refundable, 20% treasury.
+                    uint256 refundAmount =
+                        (d.amount * REFUND_BPS) / 10_000;
+
+                    d.refundAmount = refundAmount;
+
+                    refundLiability += refundAmount;
+
+                    treasuryAccrued +=
+                        d.amount - refundAmount;
+                }
+            }
+
+            classificationCursor++;
+            processed++;
+        }
+
+        // Only sweep expired refunds after all deposits
+        // have been classified.
+        if (classificationCursor == len) {
+            processed = 0;
+
+            while (
+                expiryCursor < len &&
+                processed < WITHDRAW_BATCH_SIZE
+            ) {
+                Deposit storage d =
+                    deposits[expiryCursor];
+
+                if (
+                    !d.refunded &&
+                    !d.settled &&
+                    d.refundAmount > 0
+                ) {
+                    if (
+                        block.timestamp <
+                        d.timestamp + REFUND_WINDOW
+                    ) {
+                        break;
+                    }
+
+                    d.settled = true;
+
+                    refundLiability -= d.refundAmount;
+
+                    treasuryAccrued += d.refundAmount;
+
+                    d.refundAmount = 0;
+                }
+
+                expiryCursor++;
+                processed++;
+            }
+        }
+
+        // Transfer only funds already belonging to treasury.
+        uint256 amount = treasuryAccrued;
+
+        if (amount > 0) {
+            treasuryAccrued = 0;
+
+            (bool ok, ) =
+                treasury.call{value: amount}("");
+
+            require(ok, "TREASURY_TRANSFER_FAILED");
+
+            emit ResidueWithdrawn(amount);
+        }
+    }
+
+    // ------------------------------------------------------------
+    // AUTO LAUNCH
+    // ------------------------------------------------------------
+
+    function _checkSoldOut() internal {
+        if (totalSoldShares() == MAX_SHARES) {
+            phase = 2;
+
+            emit PhaseChanged(2);
+            emit LaunchPending();
+
+            // Launch failure must not revert the final mint.
+            try this.autoLaunch() {} catch {}
+        }
+    }
+
+    function autoLaunch() external {
+        require(
+            msg.sender == address(this),
+            "SELF_ONLY"
+        );
+
+        require(phase == 2, "WRONG_PHASE");
+
+        _launch();
+    }
+
+    function launch()
+        external
+        onlyOwner
+        nonReentrant
+    {
+        require(
+            phase == 2,
+            "LAUNCH_NOT_PENDING"
+        );
+
+        _launch();
+    }
+
+    function _launch() internal {
+        uint256 bnbBalance = address(this).balance;
+
+        require(bnbBalance > 0, "NO_BNB_RAISED");
+
+        require(
+            balanceOf[address(this)] >= LP_ALLOCATION,
+            "LP_TOKENS_MISSING"
+        );
+
+        address lpPair =
+            IPancakeFactory(PANCAKE_FACTORY).getPair(
+                address(this),
+                WBNB
+            );
+
+        if (lpPair == address(0)) {
+            lpPair =
+                IPancakeFactory(PANCAKE_FACTORY).createPair(
+                    address(this),
+                    WBNB
+                );
+        }
+
+        require(
+            lpPair != address(0),
+            "PAIR_CREATION_FAILED"
+        );
+
+        uint256 bnbForLiquidity =
+            (bnbBalance * LIQUIDITY_BPS) / 10_000;
+
+        uint256 bnbForTreasury =
+            bnbBalance - bnbForLiquidity;
+
+        phase = 3;
+        pair = lpPair;
+
+        emit PhaseChanged(3);
+
+        IWBNB(WBNB).deposit{
+            value: bnbForLiquidity
+        }();
+
+        require(
+            IWBNB(WBNB).transfer(
+                lpPair,
+                bnbForLiquidity
+            ),
+            "WBNB_TRANSFER_FAILED"
+        );
+
+        // Fixed allocation: 80 million INPHIC.
+        _move(
+            address(this),
+            lpPair,
+            LP_ALLOCATION
+        );
+
+        // LP tokens go to dead address.
+        IPancakePair(lpPair).mint(DEAD);
+
+        if (bnbForTreasury > 0) {
+            (bool ok, ) =
+                treasury.call{value: bnbForTreasury}("");
+
+            require(
+                ok,
+                "TREASURY_TRANSFER_FAILED"
+            );
+        }
+
+        emit PoolOpened(
+            lpPair,
+            bnbForLiquidity,
+            LP_ALLOCATION,
+            bnbForTreasury
+        );
+    }
+
+    // ------------------------------------------------------------
+    // ADMIN
+    // ------------------------------------------------------------
+
+    function setPaused(bool value) external onlyOwner {
+        paused = value;
+    }
+
+    // ------------------------------------------------------------
+    // ERC20 TRANSFERS
+    // ------------------------------------------------------------
+
+    function transfer(
+        address to,
+        uint256 amount
+    ) external returns (bool) {
+        _transfer(msg.sender, to, amount);
+        return true;
+    }
+
+    function approve(
+        address spender,
+        uint256 amount
+    ) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+
+        emit Approval(
+            msg.sender,
+            spender,
+            amount
+        );
+
+        return true;
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool) {
+        uint256 allowed =
+            allowance[from][msg.sender];
+
+        require(allowed >= amount, "ALLOWANCE");
+
+        if (allowed != type(uint256).max) {
+            allowance[from][msg.sender] =
+                allowed - amount;
+        }
+
+        _transfer(from, to, amount);
+
+        return true;
+    }
+
+    function _transfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        require(phase == 3, "TRADING_LOCKED");
+        require(to != address(0), "ZERO_ADDRESS");
+        require(balanceOf[from] >= amount, "BALANCE");
+
+        uint256 tax;
+
+        bool exempt =
+            from == treasury ||
+            to == treasury ||
+            from == address(this) ||
+            to == address(this);
+
+        if (!exempt && pair != address(0)) {
+            if (from == pair) {
+                tax = (amount * BUY_TAX_BPS) / 10_000;
+            } else if (to == pair) {
+                tax = (amount * SELL_TAX_BPS) / 10_000;
+            }
+        }
+
+        balanceOf[from] -= amount;
+
+        if (tax > 0) {
+            balanceOf[treasury] += tax;
+
+            emit Transfer(
+                from,
+                treasury,
+                tax
+            );
+        }
+
+        balanceOf[to] += amount - tax;
+
+        emit Transfer(
+            from,
+            to,
+            amount - tax
+        );
+    }
+
+    function _move(
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        require(to != address(0), "ZERO_ADDRESS");
+        require(balanceOf[from] >= amount, "BALANCE");
+
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+
+        emit Transfer(from, to, amount);
+    }
+
+    // Direct BNB deposits are not accepted.
+    // Paid BNB must enter through mint().
+    receive() external payable {
+        revert("USE_PAID_MINT");
     }
 }
