@@ -1,9 +1,18 @@
+
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-interface IIdentityResolver {
-    function identityOf(address user) external view returns (uint256);
+// ======================================================
+// BINANCE .AI AGENT ID REGISTRY
+// ======================================================
+
+interface IAgentIDRegistry {
+    function handleOf(address wallet) external view returns (string memory);
 }
+
+// ======================================================
+// PANCAKESWAP V2
+// ======================================================
 
 interface IPancakeFactory {
     function createPair(address tokenA, address tokenB) external returns (address pair);
@@ -16,11 +25,18 @@ interface IPancakePair {
 
 interface IWBNB {
     function deposit() external payable;
-    function transfer(address to, uint256 value) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
 }
+
+// ======================================================
+// INPHIC
+// ======================================================
 
 contract INPHIC {
     // BNB Chain Mainnet
+    address public constant AGENT_ID_GATE =
+        0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F;
+
     address public constant WBNB =
         0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
 
@@ -30,49 +46,54 @@ contract INPHIC {
     address public constant DEAD =
         0x000000000000000000000000000000000000dEaD;
 
-    // ERC20
     string public constant name = "INPHIC";
     string public constant symbol = "INPHIC";
     uint8 public constant decimals = 18;
 
+    // ==================================================
+    // TOKENOMICS
+    // ==================================================
+
     uint256 public constant TOTAL_SUPPLY = 500_000_000 ether;
 
-    // Shares
-    uint256 public constant MAX_SHARES = 3500;
-    uint256 public constant FREE_SHARES = 1500;
-    uint256 public constant PAID_SHARES = 2000;
+    uint256 public constant MAX_SHARES = 3_500;
+    uint256 public constant FREE_SHARES = 1_500;
+    uint256 public constant PAID_SHARES = 2_000;
+
     uint256 public constant TOKENS_PER_SHARE = 100_000 ether;
 
-    // Allocation
     uint256 public constant LP_ALLOCATION = 80_000_000 ether;
     uint256 public constant TEAM_ALLOCATION = 50_000_000 ether;
     uint256 public constant COMMUNITY_ALLOCATION = 20_000_000 ether;
 
-    // Mint pricing
     uint256 public constant FIRST_TIER_SHARES = 10;
     uint256 public constant FIRST_TIER_PRICE = 0.0005 ether;
     uint256 public constant SECOND_TIER_PRICE = 0.001 ether;
 
-    // Fees
     uint256 public constant REFUND_WINDOW = 24 hours;
-    uint256 public constant REFUND_BPS = 8000;
-    uint256 public constant LIQUIDITY_BPS = 8000;
+    uint256 public constant REFUND_BPS = 8_000;
+
+    uint256 public constant LIQUIDITY_BPS = 8_000;
+
     uint256 public constant BUY_TAX_BPS = 300;
     uint256 public constant SELL_TAX_BPS = 300;
 
+    // ==================================================
+    // STATE
+    // ==================================================
+
     address public immutable owner;
     address payable public immutable treasury;
-    IIdentityResolver public immutable identityResolver;
 
     uint256 public totalSupply = TOTAL_SUPPLY;
 
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
 
-    // 1 = Minting
-    // 2 = Launch pending
-    // 3 = Launched
-    // 4 = Sale withdrawn
+    // 1 = minting
+    // 2 = sold out / launch pending
+    // 3 = launched
+    // 4 = sale withdrawn
     uint8 public phase = 1;
 
     bool public paused;
@@ -82,15 +103,16 @@ contract INPHIC {
     uint256 public freeSharesClaimed;
     uint256 public totalRaised;
 
-    mapping(uint256 => uint256) public paidEverById;
-    mapping(uint256 => bool) public freeClaimedById;
+    // Agent ID is represented by hash of its .ai handle.
+    mapping(bytes32 => bool) public freeClaimedById;
+    mapping(bytes32 => uint256) public paidById;
 
     struct Deposit {
         address buyer;
         uint256 amount;
         uint256 timestamp;
         uint256 shares;
-        uint256 agentId;
+        bytes32 agentId;
         bool refunded;
         bool settled;
     }
@@ -101,6 +123,15 @@ contract INPHIC {
 
     bool private entered;
 
+    // ==================================================
+    // MODIFIERS
+    // ==================================================
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "NOT_OWNER");
+        _;
+    }
+
     modifier nonReentrant() {
         require(!entered, "REENTRANCY");
         entered = true;
@@ -108,31 +139,17 @@ contract INPHIC {
         entered = false;
     }
 
-    modifier onlyOwner() {
-        require(msg.sender == owner, "NOT_OWNER");
-        _;
-    }
+    // ==================================================
+    // EVENTS
+    // ==================================================
 
     event Transfer(address indexed from, address indexed to, uint256 value);
-    event Approval(address indexed tokenOwner, address indexed spender, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
 
-    event FreeClaimed(address indexed user, uint256 indexed agentId);
+    event FreeClaimed(address indexed user, bytes32 indexed agentId);
+    event Minted(address indexed user, bytes32 indexed agentId, uint256 shares, uint256 paid);
 
-    event Minted(
-        address indexed user,
-        uint256 indexed agentId,
-        uint256 shares,
-        uint256 cost,
-        uint256 depositId
-    );
-
-    event Refunded(
-        address indexed user,
-        uint256 indexed depositId,
-        uint256 amount
-    );
-
-    event LaunchPending();
+    event DepositRefunded(address indexed user, uint256 indexed depositId, uint256 amount);
 
     event PoolOpened(
         address indexed pair,
@@ -141,55 +158,75 @@ contract INPHIC {
         uint256 treasuryAmount
     );
 
-    event SaleWithdrawn(uint256 amount);
-    event PhaseChanged(uint8 phase);
+    event ResidueWithdrawn(uint256 amount);
+    event LaunchPending();
 
-    constructor(
-        address _identityResolver,
-        address payable _treasury
-    ) {
-        require(_identityResolver != address(0), "ZERO_RESOLVER");
+    // ==================================================
+    // CONSTRUCTOR
+    // ==================================================
+
+    constructor(address payable _treasury) {
         require(_treasury != address(0), "ZERO_TREASURY");
 
         owner = msg.sender;
         treasury = _treasury;
-        identityResolver = IIdentityResolver(_identityResolver);
 
-        uint256 publicAllocation =
-            MAX_SHARES * TOKENS_PER_SHARE;
-
-        require(
-            publicAllocation +
-            LP_ALLOCATION +
-            TEAM_ALLOCATION +
-            COMMUNITY_ALLOCATION == TOTAL_SUPPLY,
-            "SUPPLY_MISMATCH"
-        );
-
+        // 350M public + 80M LP = 430M
         balanceOf[address(this)] =
-            publicAllocation + LP_ALLOCATION;
+            (MAX_SHARES * TOKENS_PER_SHARE) + LP_ALLOCATION;
 
+        // 50M team + 20M community
         balanceOf[treasury] =
             TEAM_ALLOCATION + COMMUNITY_ALLOCATION;
 
         emit Transfer(
             address(0),
             address(this),
-            publicAllocation + LP_ALLOCATION
+            balanceOf[address(this)]
         );
 
         emit Transfer(
             address(0),
             treasury,
-            TEAM_ALLOCATION + COMMUNITY_ALLOCATION
+            balanceOf[treasury]
         );
-
-        emit PhaseChanged(1);
     }
 
-    // --------------------------------------------------
-    // VIEWS
-    // --------------------------------------------------
+    // ==================================================
+    // AGENT ID CHECK
+    // ==================================================
+
+    function getAgentId(address wallet)
+        public
+        view
+        returns (bytes32)
+    {
+        string memory handle =
+            IAgentIDRegistry(AGENT_ID_GATE).handleOf(wallet);
+
+        require(bytes(handle).length > 0, "NO_AGENT_ID");
+
+        return keccak256(bytes(handle));
+    }
+
+    function checkAgentID(address wallet)
+        external
+        view
+        returns (bool valid, bytes32 agentId)
+    {
+        string memory handle =
+            IAgentIDRegistry(AGENT_ID_GATE).handleOf(wallet);
+
+        valid = bytes(handle).length > 0;
+
+        if (valid) {
+            agentId = keccak256(bytes(handle));
+        }
+    }
+
+    // ==================================================
+    // INFORMATION
+    // ==================================================
 
     function totalSoldShares() public view returns (uint256) {
         return paidSharesSold + freeSharesClaimed;
@@ -199,102 +236,117 @@ contract INPHIC {
         return deposits.length;
     }
 
-    function getDeposit(
-        uint256 depositId
-    ) external view returns (Deposit memory) {
-        require(depositId < deposits.length, "BAD_DEPOSIT_ID");
-        return deposits[depositId];
+    function getDeposit(uint256 id)
+        external
+        view
+        returns (Deposit memory)
+    {
+        return deposits[id];
     }
 
-    function buyerDepositCount(
-        address buyer
-    ) external view returns (uint256) {
+    function getBuyerDepositId(address buyer, uint256 index)
+        external
+        view
+        returns (uint256)
+    {
+        return buyerDepositIds[buyer][index];
+    }
+
+    function buyerDepositCount(address buyer)
+        external
+        view
+        returns (uint256)
+    {
         return buyerDepositIds[buyer].length;
     }
 
-    function getBuyerDepositId(
-        address buyer,
-        uint256 index
-    ) external view returns (uint256) {
-        return buyerDepositIds[buyer][index];
+    function userInfo(address user)
+        external
+        view
+        returns (
+            bytes32 agentId,
+            uint256 paidShares,
+            uint256 remainingToFirstTier,
+            bool freeClaimed,
+            uint256 userDepositCount
+        )
+    {
+        agentId = getAgentId(user);
+        paidShares = paidById[agentId];
+
+        remainingToFirstTier =
+            paidShares >= FIRST_TIER_SHARES
+                ? 0
+                : FIRST_TIER_SHARES - paidShares;
+
+        freeClaimed = freeClaimedById[agentId];
+        userDepositCount = buyerDepositIds[user].length;
     }
+
+    // ==================================================
+    // PRICING
+    // ==================================================
 
     function quoteMint(
         uint256 requested,
         uint256 alreadyPaid
-    ) public pure returns (uint256) {
+    ) public pure returns (uint256 cost) {
         require(requested > 0, "BAD_QUANTITY");
 
-        uint256 firstRemaining =
+        uint256 remaining =
             alreadyPaid >= FIRST_TIER_SHARES
                 ? 0
                 : FIRST_TIER_SHARES - alreadyPaid;
 
         uint256 firstCount =
-            requested < firstRemaining
-                ? requested
-                : firstRemaining;
+            requested < remaining ? requested : remaining;
 
         uint256 secondCount = requested - firstCount;
 
-        return
+        cost =
             (firstCount * FIRST_TIER_PRICE) +
             (secondCount * SECOND_TIER_PRICE);
     }
 
-    function userInfo(
-        address user
-    ) external view returns (
-        uint256 agentId,
-        uint256 paidSharesEver,
-        uint256 remainingFirstTier,
-        bool freeClaimed,
-        uint256 userDeposits
-    ) {
-        agentId = identityResolver.identityOf(user);
-
-        paidSharesEver =
-            agentId == 0 ? 0 : paidEverById[agentId];
-
-        remainingFirstTier =
-            paidSharesEver >= FIRST_TIER_SHARES
-                ? 0
-                : FIRST_TIER_SHARES - paidSharesEver;
-
-        freeClaimed =
-            agentId != 0 && freeClaimedById[agentId];
-
-        userDeposits = buyerDepositIds[user].length;
+    function quoteMintFor(address wallet, uint256 requested)
+        external
+        view
+        returns (uint256)
+    {
+        bytes32 id = getAgentId(wallet);
+        return quoteMint(requested, paidById[id]);
     }
 
-    // --------------------------------------------------
-    // FREE CLAIM
-    // --------------------------------------------------
+    // ==================================================
+    // FREE MINT
+    // ==================================================
 
     function claimFree() external nonReentrant {
         require(!paused, "PAUSED");
         require(phase == 1, "WRONG_PHASE");
         require(freeSharesClaimed < FREE_SHARES, "FREE_SOLD_OUT");
-        require(totalSoldShares() < MAX_SHARES, "SOLD_OUT");
 
-        uint256 id = identityResolver.identityOf(msg.sender);
+        bytes32 id = getAgentId(msg.sender);
 
-        require(id != 0, "NO_AGENT_ID");
         require(!freeClaimedById[id], "ALREADY_CLAIMED");
 
         freeClaimedById[id] = true;
         freeSharesClaimed++;
 
-        _move(address(this), msg.sender, TOKENS_PER_SHARE);
+        _move(
+            address(this),
+            msg.sender,
+            TOKENS_PER_SHARE
+        );
 
         emit FreeClaimed(msg.sender, id);
 
         _checkSoldOut();
     }
 
-    // --------------------------------------------------
+    // ==================================================
     // PAID MINT
-    // --------------------------------------------------
+    // ==================================================
 
     function mint(uint256 requested)
         external
@@ -305,27 +357,26 @@ contract INPHIC {
         require(phase == 1, "WRONG_PHASE");
         require(requested > 0, "BAD_QUANTITY");
 
-        require(
-            paidSharesSold + requested <= PAID_SHARES,
-            "PAID_SOLD_OUT"
-        );
+        bytes32 id = getAgentId(msg.sender);
 
         require(
             totalSoldShares() + requested <= MAX_SHARES,
             "SOLD_OUT"
         );
 
-        uint256 id = identityResolver.identityOf(msg.sender);
-        require(id != 0, "NO_AGENT_ID");
+        require(
+            paidSharesSold + requested <= PAID_SHARES,
+            "PAID_SOLD_OUT"
+        );
 
         uint256 cost = quoteMint(
             requested,
-            paidEverById[id]
+            paidById[id]
         );
 
         require(msg.value == cost, "INCORRECT_BNB");
 
-        paidEverById[id] += requested;
+        paidById[id] += requested;
         paidSharesSold += requested;
         totalRaised += cost;
 
@@ -351,21 +402,20 @@ contract INPHIC {
             requested * TOKENS_PER_SHARE
         );
 
-        emit Minted(msg.sender, id, requested, cost, depositId);
+        emit Minted(msg.sender, id, requested, cost);
 
         _checkSoldOut();
     }
 
-    // --------------------------------------------------
+    // ==================================================
     // REFUND
-    // --------------------------------------------------
+    // ==================================================
 
     function refundDeposit(uint256 depositId)
         external
         nonReentrant
     {
         require(phase == 1, "REFUND_CLOSED");
-        require(depositId < deposits.length, "BAD_DEPOSIT_ID");
 
         Deposit storage d = deposits[depositId];
 
@@ -380,7 +430,8 @@ contract INPHIC {
         uint256 refundAmount =
             (d.amount * REFUND_BPS) / 10_000;
 
-        uint256 treasuryPart = d.amount - refundAmount;
+        uint256 treasuryPart =
+            d.amount - refundAmount;
 
         uint256 tokenAmount =
             d.shares * TOKENS_PER_SHARE;
@@ -393,10 +444,16 @@ contract INPHIC {
         d.refunded = true;
         d.settled = true;
 
+        // Keep paidById cumulative.
+        // A refund does not reset the buyer's price tier.
         paidSharesSold -= d.shares;
         totalRaised -= d.amount;
 
-        _move(msg.sender, address(this), tokenAmount);
+        _move(
+            msg.sender,
+            address(this),
+            tokenAmount
+        );
 
         if (treasuryPart > 0) {
             (bool treasuryOk, ) =
@@ -410,13 +467,19 @@ contract INPHIC {
 
         require(ok, "REFUND_TRANSFER_FAILED");
 
-        emit Refunded(msg.sender, depositId, refundAmount);
+        emit DepositRefunded(
+            msg.sender,
+            depositId,
+            refundAmount
+        );
     }
 
-    // --------------------------------------------------
+    // ==================================================
     // WITHDRAW RESIDUE
-    // --------------------------------------------------
+    // ==================================================
 
+    // Owner stops minting and withdraws the ENTIRE BNB balance.
+    // All refund rights are closed after this call.
     function withdrawResidue()
         external
         onlyOwner
@@ -424,34 +487,29 @@ contract INPHIC {
     {
         require(phase == 1, "WRONG_PHASE");
 
-        // Stop mint and close all refund claims.
         phase = 4;
-        emit PhaseChanged(4);
 
-        // Sweep the entire native BNB balance.
         uint256 amount = address(this).balance;
 
         require(amount > 0, "NO_BNB_BALANCE");
 
-        (bool ok, ) = treasury.call{value: amount}("");
+        (bool ok, ) =
+            treasury.call{value: amount}("");
 
         require(ok, "TREASURY_TRANSFER_FAILED");
 
-        emit SaleWithdrawn(amount);
+        emit ResidueWithdrawn(amount);
     }
 
-    // --------------------------------------------------
-    // AUTO LAUNCH
-    // --------------------------------------------------
+    // ==================================================
+    // AUTOMATIC LAUNCH
+    // ==================================================
 
     function _checkSoldOut() internal {
         if (totalSoldShares() == MAX_SHARES) {
             phase = 2;
-
-            emit PhaseChanged(2);
             emit LaunchPending();
 
-            // Failed auto-launch does not revert mint.
             try this.autoLaunch() {} catch {}
         }
     }
@@ -469,55 +527,58 @@ contract INPHIC {
         _launch();
     }
 
-    function _launch() internal {
-        uint256 bnbBalance = address(this).balance;
+    // ==================================================
+    // PANCAKESWAP LAUNCH
+    // ==================================================
 
-        require(bnbBalance > 0, "NO_BNB_RAISED");
+    function _launch() internal {
+        uint256 currentBalance = address(this).balance;
+
+        uint256 bnbForLiquidity =
+            (currentBalance * LIQUIDITY_BPS) / 10_000;
+
+        uint256 bnbForTreasury =
+            currentBalance - bnbForLiquidity;
 
         require(
             balanceOf[address(this)] >= LP_ALLOCATION,
             "LP_TOKENS_MISSING"
         );
 
-        address lpPair =
+        address currentPair =
             IPancakeFactory(PANCAKE_FACTORY).getPair(
                 address(this),
                 WBNB
             );
 
-        if (lpPair == address(0)) {
-            lpPair =
+        if (currentPair == address(0)) {
+            currentPair =
                 IPancakeFactory(PANCAKE_FACTORY).createPair(
                     address(this),
                     WBNB
                 );
         }
 
-        require(lpPair != address(0), "PAIR_CREATION_FAILED");
-
-        uint256 bnbForLiquidity =
-            (bnbBalance * LIQUIDITY_BPS) / 10_000;
-
-        uint256 bnbForTreasury =
-            bnbBalance - bnbForLiquidity;
-
+        pair = currentPair;
         phase = 3;
-        pair = lpPair;
-
-        emit PhaseChanged(3);
 
         IWBNB(WBNB).deposit{value: bnbForLiquidity}();
 
         require(
-            IWBNB(WBNB).transfer(lpPair, bnbForLiquidity),
+            IWBNB(WBNB).transfer(
+                currentPair,
+                bnbForLiquidity
+            ),
             "WBNB_TRANSFER_FAILED"
         );
 
-        // Fixed LP token allocation.
-        _move(address(this), lpPair, LP_ALLOCATION);
+        _move(
+            address(this),
+            currentPair,
+            LP_ALLOCATION
+        );
 
-        // LP receipt sent to dead address.
-        IPancakePair(lpPair).mint(DEAD);
+        IPancakePair(currentPair).mint(DEAD);
 
         if (bnbForTreasury > 0) {
             (bool ok, ) =
@@ -527,24 +588,24 @@ contract INPHIC {
         }
 
         emit PoolOpened(
-            lpPair,
+            currentPair,
             bnbForLiquidity,
             LP_ALLOCATION,
             bnbForTreasury
         );
     }
 
-    // --------------------------------------------------
-    // ADMIN
-    // --------------------------------------------------
+    // ==================================================
+    // OWNER CONTROLS
+    // ==================================================
 
     function setPaused(bool value) external onlyOwner {
         paused = value;
     }
 
-    // --------------------------------------------------
+    // ==================================================
     // ERC20
-    // --------------------------------------------------
+    // ==================================================
 
     function transfer(address to, uint256 amount)
         external
@@ -612,6 +673,7 @@ contract INPHIC {
 
         if (tax > 0) {
             balanceOf[treasury] += tax;
+
             emit Transfer(from, treasury, tax);
         }
 
@@ -625,7 +687,6 @@ contract INPHIC {
         address to,
         uint256 amount
     ) internal {
-        require(to != address(0), "ZERO_ADDRESS");
         require(balanceOf[from] >= amount, "BALANCE");
 
         balanceOf[from] -= amount;
@@ -634,7 +695,5 @@ contract INPHIC {
         emit Transfer(from, to, amount);
     }
 
-    receive() external payable {
-        revert("USE_PAID_MINT");
-    }
+    receive() external payable {}
 }
