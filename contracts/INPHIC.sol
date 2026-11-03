@@ -3,11 +3,11 @@
 pragma solidity ^0.8.26;
 
 // ======================================================
-// BINANCE .AI AGENT ID REGISTRY
+// AGENT ID GATE
 // ======================================================
 
-interface IAgentIDRegistry {
-    function handleOf(address wallet) external view returns (string memory);
+interface IAgentIDGate {
+    function balanceOf(address account) external view returns (uint256);
 }
 
 // ======================================================
@@ -94,8 +94,8 @@ contract INPHIC {
     // 2 = sold out / launch pending
     // 3 = launched
     // 4 = sale withdrawn
-    uint8 public phase = 1;
 
+    uint8 public phase = 1;
     bool public paused;
     address public pair;
 
@@ -103,16 +103,16 @@ contract INPHIC {
     uint256 public freeSharesClaimed;
     uint256 public totalRaised;
 
-    // Agent ID is represented by hash of its .ai handle.
-    mapping(bytes32 => bool) public freeClaimedById;
-    mapping(bytes32 => uint256) public paidById;
+    // Wallet is the identity key.
+    // Agent ID NFT is assumed to be non-transferable.
+    mapping(address => bool) public freeClaimedByWallet;
+    mapping(address => uint256) public paidByWallet;
 
     struct Deposit {
         address buyer;
         uint256 amount;
         uint256 timestamp;
         uint256 shares;
-        bytes32 agentId;
         bool refunded;
         bool settled;
     }
@@ -146,10 +146,14 @@ contract INPHIC {
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);
 
-    event FreeClaimed(address indexed user, bytes32 indexed agentId);
-    event Minted(address indexed user, bytes32 indexed agentId, uint256 shares, uint256 paid);
+    event FreeClaimed(address indexed user);
+    event Minted(address indexed user, uint256 shares, uint256 paid);
 
-    event DepositRefunded(address indexed user, uint256 indexed depositId, uint256 amount);
+    event DepositRefunded(
+        address indexed user,
+        uint256 indexed depositId,
+        uint256 amount
+    );
 
     event PoolOpened(
         address indexed pair,
@@ -171,7 +175,7 @@ contract INPHIC {
         owner = msg.sender;
         treasury = _treasury;
 
-        // 350M public + 80M LP = 430M
+        // 350M public + 80M LP
         balanceOf[address(this)] =
             (MAX_SHARES * TOKENS_PER_SHARE) + LP_ALLOCATION;
 
@@ -193,35 +197,19 @@ contract INPHIC {
     }
 
     // ==================================================
-    // AGENT ID CHECK
+    // AGENT ID GATE
     // ==================================================
 
-    function getAgentId(address wallet)
-        public
-        view
-        returns (bytes32)
-    {
-        string memory handle =
-            IAgentIDRegistry(AGENT_ID_GATE).handleOf(wallet);
-
-        require(bytes(handle).length > 0, "NO_AGENT_ID");
-
-        return keccak256(bytes(handle));
+    function hasAgentID(address wallet) public view returns (bool) {
+        return IAgentIDGate(AGENT_ID_GATE).balanceOf(wallet) > 0;
     }
 
-    function checkAgentID(address wallet)
-        external
-        view
-        returns (bool valid, bytes32 agentId)
-    {
-        string memory handle =
-            IAgentIDRegistry(AGENT_ID_GATE).handleOf(wallet);
+    function checkAgentID(address wallet) external view returns (bool) {
+        return hasAgentID(wallet);
+    }
 
-        valid = bytes(handle).length > 0;
-
-        if (valid) {
-            agentId = keccak256(bytes(handle));
-        }
+    function _requireAgentID(address wallet) internal view {
+        require(hasAgentID(wallet), "NO_AGENT_ID");
     }
 
     // ==================================================
@@ -264,22 +252,23 @@ contract INPHIC {
         external
         view
         returns (
-            bytes32 agentId,
+            bool validAgentID,
             uint256 paidShares,
             uint256 remainingToFirstTier,
             bool freeClaimed,
             uint256 userDepositCount
         )
     {
-        agentId = getAgentId(user);
-        paidShares = paidById[agentId];
+        validAgentID = hasAgentID(user);
+
+        paidShares = paidByWallet[user];
 
         remainingToFirstTier =
             paidShares >= FIRST_TIER_SHARES
                 ? 0
                 : FIRST_TIER_SHARES - paidShares;
 
-        freeClaimed = freeClaimedById[agentId];
+        freeClaimed = freeClaimedByWallet[user];
         userDepositCount = buyerDepositIds[user].length;
     }
 
@@ -313,8 +302,12 @@ contract INPHIC {
         view
         returns (uint256)
     {
-        bytes32 id = getAgentId(wallet);
-        return quoteMint(requested, paidById[id]);
+        _requireAgentID(wallet);
+
+        return quoteMint(
+            requested,
+            paidByWallet[wallet]
+        );
     }
 
     // ==================================================
@@ -326,11 +319,14 @@ contract INPHIC {
         require(phase == 1, "WRONG_PHASE");
         require(freeSharesClaimed < FREE_SHARES, "FREE_SOLD_OUT");
 
-        bytes32 id = getAgentId(msg.sender);
+        _requireAgentID(msg.sender);
 
-        require(!freeClaimedById[id], "ALREADY_CLAIMED");
+        require(
+            !freeClaimedByWallet[msg.sender],
+            "ALREADY_CLAIMED"
+        );
 
-        freeClaimedById[id] = true;
+        freeClaimedByWallet[msg.sender] = true;
         freeSharesClaimed++;
 
         _move(
@@ -339,7 +335,7 @@ contract INPHIC {
             TOKENS_PER_SHARE
         );
 
-        emit FreeClaimed(msg.sender, id);
+        emit FreeClaimed(msg.sender);
 
         _checkSoldOut();
     }
@@ -357,7 +353,7 @@ contract INPHIC {
         require(phase == 1, "WRONG_PHASE");
         require(requested > 0, "BAD_QUANTITY");
 
-        bytes32 id = getAgentId(msg.sender);
+        _requireAgentID(msg.sender);
 
         require(
             totalSoldShares() + requested <= MAX_SHARES,
@@ -371,12 +367,12 @@ contract INPHIC {
 
         uint256 cost = quoteMint(
             requested,
-            paidById[id]
+            paidByWallet[msg.sender]
         );
 
         require(msg.value == cost, "INCORRECT_BNB");
 
-        paidById[id] += requested;
+        paidByWallet[msg.sender] += requested;
         paidSharesSold += requested;
         totalRaised += cost;
 
@@ -388,7 +384,6 @@ contract INPHIC {
                 amount: cost,
                 timestamp: block.timestamp,
                 shares: requested,
-                agentId: id,
                 refunded: false,
                 settled: false
             })
@@ -402,7 +397,7 @@ contract INPHIC {
             requested * TOKENS_PER_SHARE
         );
 
-        emit Minted(msg.sender, id, requested, cost);
+        emit Minted(msg.sender, requested, cost);
 
         _checkSoldOut();
     }
@@ -416,6 +411,8 @@ contract INPHIC {
         nonReentrant
     {
         require(phase == 1, "REFUND_CLOSED");
+
+        require(depositId < deposits.length, "INVALID_DEPOSIT");
 
         Deposit storage d = deposits[depositId];
 
@@ -444,8 +441,7 @@ contract INPHIC {
         d.refunded = true;
         d.settled = true;
 
-        // Keep paidById cumulative.
-        // A refund does not reset the buyer's price tier.
+        // Price tier remains cumulative after refund.
         paidSharesSold -= d.shares;
         totalRaised -= d.amount;
 
@@ -478,8 +474,9 @@ contract INPHIC {
     // WITHDRAW RESIDUE
     // ==================================================
 
-    // Owner stops minting and withdraws the ENTIRE BNB balance.
-    // All refund rights are closed after this call.
+    // Owner stops the sale and sends the entire BNB balance
+    // to treasury. All refund rights close after this call.
+
     function withdrawResidue()
         external
         onlyOwner
@@ -508,6 +505,7 @@ contract INPHIC {
     function _checkSoldOut() internal {
         if (totalSoldShares() == MAX_SHARES) {
             phase = 2;
+
             emit LaunchPending();
 
             try this.autoLaunch() {} catch {}
@@ -673,13 +671,14 @@ contract INPHIC {
 
         if (tax > 0) {
             balanceOf[treasury] += tax;
-
             emit Transfer(from, treasury, tax);
         }
 
         balanceOf[to] += amount - tax;
 
         emit Transfer(from, to, amount - tax);
+
+        return;
     }
 
     function _move(
