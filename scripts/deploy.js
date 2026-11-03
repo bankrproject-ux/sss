@@ -32,6 +32,7 @@ function askHidden(question) {
     function cleanup() {
       if (finished) return;
       finished = true;
+
       stdin.removeListener("data", onData);
       stdin.setRawMode(false);
       stdin.pause();
@@ -101,34 +102,29 @@ async function getSigner() {
   return { signer, provider, balance };
 }
 
+// ======================================================
+// DEPLOY INPHIC
+// ======================================================
+
 async function deployInphic() {
   console.log("\n========== DEPLOY INPHIC ==========\n");
 
   const { signer, provider, balance } = await getSigner();
 
-  const identityInput = await ask(
-    "Agent ID Gate / Identity Resolver address: "
-  );
-
   const treasuryInput = await ask(
-    "Treasury wallet address: "
+    "Enter Treasury wallet address: "
   );
 
-  let identityResolver;
   let treasury;
 
   try {
-    identityResolver = hre.ethers.getAddress(identityInput);
     treasury = hre.ethers.getAddress(treasuryInput);
   } catch {
-    throw new Error("Invalid Gate or Treasury address.");
+    throw new Error("Invalid Treasury address.");
   }
 
-  if (
-    identityResolver === hre.ethers.ZeroAddress ||
-    treasury === hre.ethers.ZeroAddress
-  ) {
-    throw new Error("Gate and Treasury cannot be zero address.");
+  if (treasury === hre.ethers.ZeroAddress) {
+    throw new Error("Treasury address cannot be zero.");
   }
 
   const factory = await hre.ethers.getContractFactory(
@@ -136,10 +132,11 @@ async function deployInphic() {
     signer
   );
 
-  const constructorArgs = [
-    identityResolver,
-    treasury
-  ];
+  // Latest INPHIC constructor:
+  // constructor(address payable _treasury)
+  // Agent ID Gate is hardcoded in the Solidity contract.
+
+  const constructorArgs = [treasury];
 
   const deployTx = await factory.getDeployTransaction(
     ...constructorArgs
@@ -164,7 +161,11 @@ async function deployInphic() {
   console.log("Contract: INPHIC");
   console.log("Network: BNB Smart Chain Mainnet");
   console.log("Chain ID: 56");
-  console.log("Agent ID Gate:", identityResolver);
+  console.log("Deployer:", signer.address);
+  console.log(
+    "Agent ID Gate:",
+    "0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F"
+  );
   console.log("Treasury:", treasury);
 
   console.log(
@@ -185,7 +186,9 @@ async function deployInphic() {
   );
 
   if (balance < safetyCost) {
-    throw new Error("Insufficient BNB for deployment.");
+    throw new Error(
+      "Insufficient BNB for deployment with 20% gas buffer."
+    );
   }
 
   const confirm = await ask(
@@ -193,13 +196,15 @@ async function deployInphic() {
   );
 
   if (confirm !== "DEPLOY") {
-    console.log("Deployment cancelled.");
+    console.log("Deployment cancelled. No transaction sent.");
     return;
   }
 
   console.log("\nDeploying INPHIC...");
 
-  const contract = await factory.deploy(...constructorArgs);
+  const contract = await factory.deploy(
+    ...constructorArgs
+  );
 
   console.log("Transaction sent. Waiting for confirmation...");
 
@@ -211,13 +216,23 @@ async function deployInphic() {
   console.log("\n================================");
   console.log(" INPHIC DEPLOYED SUCCESSFULLY");
   console.log("================================");
+
   console.log("Contract:", address);
   console.log("Deployer:", signer.address);
-  console.log("Gate:", identityResolver);
+  console.log("Agent ID Gate:", "Hardcoded in contract");
   console.log("Treasury:", treasury);
   console.log("Transaction:", tx.hash);
-  console.log(`Explorer: https://bscscan.com/address/${address}`);
+
+  console.log(
+    `Explorer: https://bscscan.com/address/${address}`
+  );
+
+  console.log("\nSave this INPHIC contract address.");
 }
+
+// ======================================================
+// WITHDRAW RESIDUE
+// ======================================================
 
 async function withdrawResidue() {
   console.log("\n========== WITHDRAW RESIDUE ==========\n");
@@ -259,9 +274,13 @@ async function withdrawResidue() {
   }
 
   const treasury = await contract.treasury();
-  const contractBalance = await provider.getBalance(contractAddress);
+
+  const contractBalance = await provider.getBalance(
+    contractAddress
+  );
 
   console.log("Treasury:", treasury);
+
   console.log(
     "Contract BNB balance:",
     hre.ethers.formatEther(contractBalance),
@@ -307,23 +326,31 @@ async function withdrawResidue() {
   console.log("\n================================");
   console.log(" WITHDRAW SUCCESSFUL");
   console.log("================================");
+
   console.log("Contract:", contractAddress);
   console.log("Treasury:", treasury);
   console.log("Transaction:", tx.hash);
+
   console.log(
     "Remaining contract balance:",
     hre.ethers.formatEther(remainingBalance),
     "BNB"
   );
+
   console.log(
     `Explorer: https://bscscan.com/tx/${tx.hash}`
   );
 }
 
+// ======================================================
+// MAIN MENU
+// ======================================================
+
 async function main() {
   console.log("\n================================");
   console.log("       INPHIC DEPLOYER");
   console.log("================================");
+
   console.log("1. Deploy INPHIC");
   console.log("2. Withdraw Residue");
   console.log("0. Exit");
@@ -343,7 +370,7 @@ async function main() {
 
 main().catch((error) => {
   console.error(
-    "\nError:",
+    "\nDeployment error:",
     error.shortMessage || error.reason || error.message
   );
 
